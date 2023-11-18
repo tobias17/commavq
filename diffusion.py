@@ -26,15 +26,15 @@ LOAD_COUNT     = 20
 ITERATIONS  = 100000
 SAVE_EVERY  = 2000
 TEST_EVERY  = 100
-TEST_COUNT  = 4
+TEST_COUNT  = 8
 LR = 2**-14
-BS = 256
+BS = 16
 
-DIM = 256
+DIM = 512
 N_HEADS = 8
-D_HEADS = 32
-CTX_LAYERS = 2
-DEN_LAYERS = 2
+D_HEADS = 64
+CTX_LAYERS = 4
+DEN_LAYERS = 8
 TIMESTEPS = 1000
 
 VOCAB_SIZE = 1024
@@ -232,7 +232,7 @@ def train():
             train_datas.append(np.load(dataset[split][i,0]['path'][0]))
          except Exception as ex:
             print(f"encountered error at dataset[{split}][{i}]: {ex}")
-   test_datas = [np.load(dataset['40'][i,0]['path'][0]) for i in range(TEST_COUNT)]
+   test_datas = [np.load(dataset['40'][i,0]['path'][0]) for i in range(10)]
    print(f"loaded dataset in {time.time() - s_time:.1f} seconds")
 
    s_time = time.time()
@@ -303,7 +303,7 @@ def generate(gen_count=10):
 
    np.random.seed(1337)
    model = CommaVQDiffuser(*MODEL_PARAMS)
-   load_state_dict(model, safe_load(os.path.join("weights", "2023_11_14_21_57_40_539773", MODEL_FILENAME.format("46000"))))
+   load_state_dict(model, safe_load(os.path.join("weights", "2023_11_15_21_55_52_582087", MODEL_FILENAME.format("36000"))))
 
    data = np.load(load_dataset("commaai/commavq", split='40[:2]')[1,0]['path'][0])
    prev_frames = np.zeros((CTX_FRAMES+gen_count,FRAME_SIZE))
@@ -318,14 +318,16 @@ def generate(gen_count=10):
 
       # alphas = Tensor(timesteps.astype(np.float32) / float(TIMESTEPS-1), dtype=dtypes.float32, requires_grad=False).reshape((-1,1,1))
 
-      timesteps = [999, 749, 499, 249]
-      x_t = Tensor.randn(1,FRAME_SIZE,DIM)
+      timesteps = [749, 499, 249]
+      # x_t = Tensor.randn(1,FRAME_SIZE,DIM)
+      pred_x_0 = model.make_x_0_from(Tensor(prev_frames[i+CTX_FRAMES-1].reshape(1,-1), dtype=dtypes.float32))
       for j, t in enumerate(timesteps):
-         if j > 0:
-            a = Tensor(t/float(TIMESTEPS-1), dtype=dtypes.float32)
-            x_t = model.make_x_0_from(output)*(1-a) + Tensor.randn(*x_t.shape)*a
+         # if j > 0:
+         a = Tensor(t/float(TIMESTEPS-1), dtype=dtypes.float32)
+         x_t = pred_x_0*(1-a) + Tensor.randn(*pred_x_0.shape)*a
          timestep = Tensor([t], dtype=dtypes.float32, requires_grad=False).reshape((1,1)).expand((1,128))
          e_t = model(x_t, context, timestep)
+         pred_x_0 = x_t - e_t
          output = model.estimate(x_t, e_t).argmax(axis=-1)
          print(j)
          plt.clf()
