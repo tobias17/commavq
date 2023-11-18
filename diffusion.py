@@ -17,6 +17,7 @@ import cv2
 
 SAVE_FOLDER    = f"weights/{datetime.now()}".replace(" ", "_").replace(":", "_").replace("-", "_").replace(".", "_")
 MODEL_FILENAME = "model_{0}.safetensor"
+EMBED_CLASSIFY_FILENAME = "embed_classify_{0}.safetensor"
 ITER_FOLDER    = "iteration_{0}"
 IMG_FILENAME   = "{0}_{1}.png"
 LOSS_FILENAME  = "graph_loss.png"
@@ -24,10 +25,10 @@ ACCS_FILENAME  = "graph_acc.png"
 LOAD_COUNT     = 20
 
 ITERATIONS  = 100000
-SAVE_EVERY  = 2000
-TEST_EVERY  = 100
+SAVE_EVERY  = 1000
+TEST_EVERY  = 50
 TEST_COUNT  = 8
-LR = 2**-14
+LR = 2**-12
 BS = 16
 
 DIM = 512
@@ -124,10 +125,6 @@ class CommaVQDiffuser:
       for _ in range(ctx_layers):
          self.ctx_layers.append(BasicTransformerBlock(dim, dim, n_heads, d_heads))
 
-      self.x_0_embed = [
-         Embedding(vocab_size, dim),
-         LayerNorm(dim),
-      ]
 
       self.den_size = den_size
       self.den_pos_embed = Embedding(den_size, dim)
@@ -136,15 +133,12 @@ class CommaVQDiffuser:
       for _ in range(den_layers):
          self.den_layers.append(PosTimeFusion(dim, dim*2))
          self.den_layers.append(BasicTransformerBlock(dim, dim, n_heads, d_heads))
-      self.class_head = Linear(dim, vocab_size)
 
    def make_context_from(self, x:Tensor) -> Tensor:
       tok_emb = self.ctx_tok_embed(x)
       pos_emb = self.ctx_pos_embed(Tensor.arange(0, x.shape[-1], requires_grad=False).reshape([1]*(len(x.shape)-1)+[x.shape[-1]]))
       return (tok_emb + pos_emb).sequential(self.ctx_layers)
    
-   def make_x_0_from(self, x:Tensor) -> Tensor:
-      return x.sequential(self.x_0_embed)
 
    def __call__(self, x:Tensor, context:Tensor, timesteps:Tensor):
       pos_emb  = self.den_pos_embed(Tensor.arange(0, self.den_size, requires_grad=False).reshape((1,-1))).expand((context.shape[0],self.den_size,-1))
@@ -154,11 +148,23 @@ class CommaVQDiffuser:
          elif isinstance(layer, BasicTransformerBlock): x = layer(x, context)
          else: raise ValueError(f"got unsupported denoising layer {type(layer)}")
       return x
-
-   def estimate(self, x:Tensor, e_t:Tensor):
-      return self.class_head(x - e_t).log_softmax()
-
 MODEL_PARAMS = [VOCAB_SIZE, CTX_SIZE, CTX_LAYERS, FRAME_SIZE, DEN_LAYERS, DIM, N_HEADS, D_HEADS]
+
+class EmbedClassifyForDiffusion:
+   def __init__(self, vocab_size, dim):
+      self.x_0_embed = [
+         Embedding(vocab_size, dim),
+         LayerNorm(dim),
+      ]
+      self.class_head = Linear(dim, vocab_size)
+
+   def make_x_0_from(self, x:Tensor) -> Tensor:
+      return x.sequential(self.x_0_embed)
+
+   def estimate(self, x:Tensor) -> Tensor:
+      return self.class_head(x).log_softmax()
+EMBED_CLASSIFY_PARAMS = [VOCAB_SIZE, DIM]
+
 
 
 
@@ -188,7 +194,28 @@ def _save_decoded_image(output, filepath):
 train_timesteps = np.arange(1, TIMESTEPS)
 test_timesteps = np.array(list(range(TIMESTEPS-1, 1, -TIMESTEPS//TEST_COUNT))[::-1])
 
-def save_test_snapshot(step, outputs, baseline, train_loss, test_loss, train_accs, test_accs):
+def save_test_snapshot_embed_classify(step, outputs, baselines, train_loss, test_loss, train_acc, test_acc):
+   for i in range(TEST_COUNT):
+      baseline_path = os.path.join(SAVE_FOLDER, IMG_FILENAME.format('test_baseline', i))
+      if not os.path.exists(baseline_path):
+         _save_decoded_image(baselines[i], baseline_path)
+      _save_decoded_image(outputs[i], os.path.join(SAVE_FOLDER, ITER_FOLDER.format(step), IMG_FILENAME.format('decoded_test', i)))
+   
+   plt.clf()
+   plt.plot(np.arange(0, len(train_loss)), train_loss, label='train')
+   plt.plot(np.arange(TEST_EVERY, len(test_loss)*TEST_EVERY+1, TEST_EVERY), test_loss, label='test')
+   plt.ylim(0, None)
+   plt.legend()
+   plt.savefig(os.path.join(SAVE_FOLDER, LOSS_FILENAME))
+   
+   plt.clf()
+   plt.plot(np.arange(0, len(train_acc)), train_acc, label='train')
+   plt.plot(np.arange(TEST_EVERY, len(test_acc)*TEST_EVERY+1, TEST_EVERY), test_acc, label='test')
+   plt.ylim(0.0, 1.0)
+   plt.legend()
+   plt.savefig(os.path.join(SAVE_FOLDER, ACCS_FILENAME))
+
+def save_test_snapshot_diffusion(step, outputs, baseline, train_loss, test_loss, train_accs, test_accs):
    baseline_path = os.path.join(SAVE_FOLDER, IMG_FILENAME.format('test_baseline', '0'))
    if not os.path.exists(baseline_path):
       _save_decoded_image(baseline, baseline_path)
@@ -212,13 +239,7 @@ def save_test_snapshot(step, outputs, baseline, train_loss, test_loss, train_acc
    plt.legend()
    plt.savefig(os.path.join(SAVE_FOLDER, ACCS_FILENAME))
 
-
-def train():
-   np.random.seed(1337)
-   model = CommaVQDiffuser(*MODEL_PARAMS)
-   # sd = get_state_dict(model)
-   opt = Adam(get_parameters(model), LR)
-   
+def load_datasets():
    s_time = time.time()
    dataset = {}
    for i in list(range(LOAD_COUNT)) + ['40[:10]']:
@@ -232,8 +253,77 @@ def train():
             train_datas.append(np.load(dataset[split][i,0]['path'][0]))
          except Exception as ex:
             print(f"encountered error at dataset[{split}][{i}]: {ex}")
-   test_datas = [np.load(dataset['40'][i,0]['path'][0]) for i in range(10)]
+   test_datas = [np.load(dataset['40'][i,0]['path'][0]) for i in range(TEST_COUNT)]
    print(f"loaded dataset in {time.time() - s_time:.1f} seconds")
+
+   return train_datas, test_datas
+
+def train_embed_classify(bs=BS, lr=LR, sigma=0.15):
+   np.random.seed(1337)
+   model = EmbedClassifyForDiffusion(*EMBED_CLASSIFY_PARAMS)
+   opt = Adam(get_parameters(model), lr)
+   
+   train_datas, test_datas = load_datasets()
+
+   s_time = time.time()
+   step, is_test = 0, False
+   train_loss, test_loss = [], []
+   train_acc,  test_acc  = [], []
+   while step < ITERATIONS:
+      if is_test:
+         datas = test_datas
+         index = 0
+         size = TEST_COUNT
+      else:
+         datas = [train_datas[i % len(train_datas)] for i in range(step*bs, (step+1)*bs)]
+         index = np.random.randint(datas[0].shape[0] - 1)
+         size = bs
+
+      target_frames = np.array([d[index] for d in datas]).reshape(size,-1)
+      target_frames = Tensor(target_frames, dtype=dtypes.float32)
+
+      x_0 = model.make_x_0_from(target_frames)
+      x_0 = x_0*(1-sigma) + Tensor.randn(*x_0.shape)*sigma
+      output = model.estimate(x_0)
+      loss = output.sparse_categorical_crossentropy(target_frames)
+
+      if is_test:
+         test_loss.append(loss.numpy())
+         test_acc.append((output.argmax(axis=-1) == target_frames).mean().numpy())
+      else:
+         loss.realize()
+         opt.zero_grad()
+         loss.backward()
+         opt.step()
+
+         train_loss.append(loss.numpy())
+         train_acc.append((output.argmax(axis=-1) == target_frames).mean().numpy())
+      
+      if (step+1) % TEST_EVERY == 0:
+         if is_test:
+            step += 1
+            print(f"Step {str(step): >5} | Train Loss: {sum(train_loss[-TEST_EVERY:])/TEST_EVERY:.4f} | Train Accuracy: {100.0*sum(train_acc[-TEST_EVERY:])/TEST_EVERY:.2f}% | Test Loss: {test_loss[-1]:.4f} | Test Accuracy: {100.0*test_acc[-1]:.2f}% | {(time.time() - s_time) / float(TEST_EVERY):.2f} sec/iter")
+            s_time = time.time()
+            save_test_snapshot_embed_classify(step, output.argmax(axis=-1), target_frames, train_loss, test_loss, train_acc, test_acc)
+         is_test = not is_test
+      else:
+         step += 1
+
+      if step % SAVE_EVERY == 0:
+         if not os.path.exists(SAVE_FOLDER):
+            os.makedirs(SAVE_FOLDER)
+         safe_save(get_state_dict(model), os.path.join(SAVE_FOLDER, EMBED_CLASSIFY_FILENAME.format(step)))
+
+
+def train_diffusion_model():
+   np.random.seed(1337)
+   model = CommaVQDiffuser(*MODEL_PARAMS)
+   embed_classify = EmbedClassifyForDiffusion(*EMBED_CLASSIFY_PARAMS)
+   load_state_dict(embed_classify, safe_load("weights/embed_classify/embed_classify_300.safetensor"))
+   # sd = get_state_dict(model)
+   opt = Adam(get_parameters(model), LR)
+   
+   train_datas, test_datas = load_datasets()
 
    s_time = time.time()
    step, test_index = 0, 0
@@ -255,12 +345,13 @@ def train():
       # timesteps = np.random.randint(1, TIMESTEPS, size=(size,1)) if test_index == 0 else test_timesteps.reshape(-1,1)
       timesteps = np.random.choice(train_timesteps, size=(BS,1), replace=False) if test_index == 0 else test_timesteps.reshape(-1,1)
       alphas = Tensor(timesteps.astype(np.float32) / float(TIMESTEPS-1), dtype=dtypes.float32, requires_grad=False).reshape((-1,1,1))
-      x_0 = model.make_x_0_from(target_frame)
-      x_t = (1-alphas)*x_0 + alphas*Tensor.randn(*x_0.shape)
+      x_0 = embed_classify.make_x_0_from(target_frame).detach()
+      x_t = ((1-alphas)*x_0 + alphas*Tensor.randn(*x_0.shape))
 
       e_t = model(x_t, context, Tensor(timesteps, dtype=dtypes.float32, requires_grad=False))
-      output = model.estimate(x_t, e_t)
-      loss = output.sparse_categorical_crossentropy(target_frame)
+      pred_x_0 = x_t - e_t
+      loss = (pred_x_0 - x_0).abs().sum() / prod(e_t.shape)
+      output = embed_classify.estimate(pred_x_0)
 
       if test_index == 0:
          loss.realize()
@@ -281,7 +372,7 @@ def train():
          if test_index == 2:
             print(f"Step {str(step+1): >5} | Train Loss: {sum(train_loss[-1:]):.4f} | Train Accuracy: {100.0*sum(train_accs[i][-1] for i in range(TEST_COUNT))/TEST_COUNT:.2f}% | Test Loss: {test_loss[-1]:.4f} | Test Accuracy: {100.0*sum(train_accs[i][-1] for i in range(TEST_COUNT))/TEST_COUNT:.2f}% | {(time.time() - s_time) / float(TEST_EVERY):.2f} sec/iter")
             s_time = time.time()
-            save_test_snapshot(step+1, output.argmax(axis=-1), target_frame, train_loss, test_loss, train_accs, test_accs)
+            save_test_snapshot_diffusion(step+1, output.argmax(axis=-1), target_frame, train_loss, test_loss, train_accs, test_accs)
 
          test_index += 1
          if test_index > 2:
@@ -298,14 +389,16 @@ def train():
 
 
 
-def generate(gen_count=10):
+def generate(gen_count=20, iter=8000):
    Tensor.no_grad = True
 
    np.random.seed(1337)
    model = CommaVQDiffuser(*MODEL_PARAMS)
-   load_state_dict(model, safe_load(os.path.join("weights", "2023_11_15_21_55_52_582087", MODEL_FILENAME.format("36000"))))
+   load_state_dict(model, safe_load(os.path.join("weights", "2023_11_17_05_47_57_432192", MODEL_FILENAME.format(iter))))
+   embed_classify = EmbedClassifyForDiffusion(*EMBED_CLASSIFY_PARAMS)
+   load_state_dict(embed_classify, safe_load("weights/embed_classify/embed_classify_300.safetensor"))
 
-   data = np.load(load_dataset("commaai/commavq", split='40[:2]')[1,0]['path'][0])
+   data = np.load(load_dataset("commaai/commavq", split='40[:2]')[0,0]['path'][0])
    prev_frames = np.zeros((CTX_FRAMES+gen_count,FRAME_SIZE))
    prev_frames[:CTX_FRAMES] = data[:CTX_FRAMES].reshape((CTX_FRAMES,-1))
 
@@ -318,9 +411,10 @@ def generate(gen_count=10):
 
       # alphas = Tensor(timesteps.astype(np.float32) / float(TIMESTEPS-1), dtype=dtypes.float32, requires_grad=False).reshape((-1,1,1))
 
-      timesteps = [749, 499, 249]
+      timesteps = [700, 550, 400, 200] # 999, 850, 
       # x_t = Tensor.randn(1,FRAME_SIZE,DIM)
-      pred_x_0 = model.make_x_0_from(Tensor(prev_frames[i+CTX_FRAMES-1].reshape(1,-1), dtype=dtypes.float32))
+      pred_x_0 = embed_classify.make_x_0_from(Tensor(prev_frames[i+CTX_FRAMES-1].reshape(1,-1), dtype=dtypes.float32))
+      # pred_x_0 = Tensor.randn(*pred_x_0.shape)
       for j, t in enumerate(timesteps):
          # if j > 0:
          a = Tensor(t/float(TIMESTEPS-1), dtype=dtypes.float32)
@@ -328,22 +422,14 @@ def generate(gen_count=10):
          timestep = Tensor([t], dtype=dtypes.float32, requires_grad=False).reshape((1,1)).expand((1,128))
          e_t = model(x_t, context, timestep)
          pred_x_0 = x_t - e_t
-         output = model.estimate(x_t, e_t).argmax(axis=-1)
-         print(j)
-         plt.clf()
-         plt.imshow(_to_image(output[0]))
-         plt.show()
-
+         output = embed_classify.estimate(pred_x_0).argmax(axis=-1)
 
       prev_frames[CTX_FRAMES+i,:] = output.numpy()[0,:]
       img = _to_image(output[0])
 
-      plt.clf()
-      plt.imshow(img)
-      plt.savefig(f"outputs/frame_{i}.png")
-
-      # cv2.imshow('frames', img[...,::-1])
-      # cv2.waitKey()
+      cv_img = img[...,::-1]
+      cv2.imshow('frames', cv2.resize(cv_img, (cv_img.shape[1]*4, cv_img.shape[0]*4)))
+      cv2.waitKey()
 
       times.append(time.time() - s_time)
       while len(times) > 4:
