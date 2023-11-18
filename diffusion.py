@@ -24,17 +24,18 @@ ACCS_FILENAME  = "graph_acc.png"
 LOAD_COUNT     = 20
 
 ITERATIONS  = 100000
-SAVE_EVERY  = 4000
+SAVE_EVERY  = 2000
 TEST_EVERY  = 100
-TEST_COUNT  = 2
-LR = 2**-12
-BS = 2
+TEST_COUNT  = 4
+LR = 2**-14
+BS = 256
 
-DIM = 384
-N_HEADS = 6
-D_HEADS = 64
-CTX_LAYERS = 3
-DEC_LAYERS = 4
+DIM = 256
+N_HEADS = 8
+D_HEADS = 32
+CTX_LAYERS = 2
+DEN_LAYERS = 2
+TIMESTEPS = 1000
 
 VOCAB_SIZE = 1024
 FRAME_SIZE = 8*16
@@ -95,19 +96,46 @@ class BasicTransformerBlock:
       x = self.ff(self.norm3(x)).dropout(self.dropout) + x
       return x
 
+class PosTimeFusion:
+   def __init__(self, dim, hid_dim):
+      self.inp_emb = [
+         Linear(dim, hid_dim, bias=False),
+      ]
+      self.pos_emb = [
+         Linear(dim, hid_dim, bias=False),
+      ]
+      self.time_emb = [
+         Linear(dim, hid_dim, bias=False),
+      ]
+      self.out = [
+         Tensor.silu,
+         Linear(hid_dim, dim, bias=False),
+      ]
+   
+   def __call__(self, x:Tensor, pos:Tensor, time:Tensor) -> Tensor:
+      h = x.sequential(self.inp_emb) + pos.sequential(self.pos_emb) + time.sequential(self.time_emb)
+      return h.sequential(self.out) + x
+
 class CommaVQDiffuser:
-   def __init__(self, vocab_size, ctx_size, ctx_layers, dec_size, dec_layers, dim, n_heads, d_heads):
+   def __init__(self, vocab_size, ctx_size, ctx_layers, den_size, den_layers, dim, n_heads, d_heads):
       self.ctx_tok_embed = Embedding(vocab_size, dim)
       self.ctx_pos_embed = Embedding(ctx_size,   dim)
       self.ctx_layers = []
       for _ in range(ctx_layers):
          self.ctx_layers.append(BasicTransformerBlock(dim, dim, n_heads, d_heads))
 
-      self.dec_size = dec_size
-      self.dec_pos_embed = Embedding(dec_size, dim)
-      self.dec_layers = []
-      for _ in range(dec_layers):
-         self.dec_layers.append(BasicTransformerBlock(dim, dim, n_heads, d_heads))
+      self.x_0_embed = [
+         Embedding(vocab_size, dim),
+         LayerNorm(dim),
+      ]
+
+      self.den_size = den_size
+      self.den_pos_embed = Embedding(den_size, dim)
+      self.den_time_embed = Embedding(TIMESTEPS, dim)
+      self.den_layers = []
+      for _ in range(den_layers):
+         self.den_layers.append(PosTimeFusion(dim, dim*2))
+         self.den_layers.append(BasicTransformerBlock(dim, dim, n_heads, d_heads))
       self.class_head = Linear(dim, vocab_size)
 
    def make_context_from(self, x:Tensor) -> Tensor:
@@ -115,13 +143,22 @@ class CommaVQDiffuser:
       pos_emb = self.ctx_pos_embed(Tensor.arange(0, x.shape[-1], requires_grad=False).reshape([1]*(len(x.shape)-1)+[x.shape[-1]]))
       return (tok_emb + pos_emb).sequential(self.ctx_layers)
    
-   def __call__(self, context:Tensor):
-      x = self.dec_pos_embed(Tensor.arange(0, self.dec_size, requires_grad=False).reshape((1,-1))).expand((context.shape[0],self.dec_size,-1))
-      for layer in self.dec_layers:
-         x = layer(x, context)
-      return self.class_head(x).log_softmax()
+   def make_x_0_from(self, x:Tensor) -> Tensor:
+      return x.sequential(self.x_0_embed)
 
-MODEL_PARAMS = [VOCAB_SIZE, CTX_SIZE, CTX_LAYERS, FRAME_SIZE, DEC_LAYERS, DIM, N_HEADS, D_HEADS]
+   def __call__(self, x:Tensor, context:Tensor, timesteps:Tensor):
+      pos_emb  = self.den_pos_embed(Tensor.arange(0, self.den_size, requires_grad=False).reshape((1,-1))).expand((context.shape[0],self.den_size,-1))
+      time_emb = self.den_time_embed(timesteps)
+      for layer in self.den_layers:
+         if   isinstance(layer, PosTimeFusion):         x = layer(x, pos_emb, time_emb)
+         elif isinstance(layer, BasicTransformerBlock): x = layer(x, context)
+         else: raise ValueError(f"got unsupported denoising layer {type(layer)}")
+      return x
+
+   def estimate(self, x:Tensor, e_t:Tensor):
+      return self.class_head(x - e_t).log_softmax()
+
+MODEL_PARAMS = [VOCAB_SIZE, CTX_SIZE, CTX_LAYERS, FRAME_SIZE, DEN_LAYERS, DIM, N_HEADS, D_HEADS]
 
 
 
@@ -147,23 +184,30 @@ def _save_decoded_image(output, filepath):
    plt.imshow(img)
    plt.savefig(filepath)
 
-def save_test_snapshot(step, outputs, baselines, train_loss, test_loss, train_acc, test_acc):
+
+train_timesteps = np.arange(1, TIMESTEPS)
+test_timesteps = np.array(list(range(TIMESTEPS-1, 1, -TIMESTEPS//TEST_COUNT))[::-1])
+
+def save_test_snapshot(step, outputs, baseline, train_loss, test_loss, train_accs, test_accs):
+   baseline_path = os.path.join(SAVE_FOLDER, IMG_FILENAME.format('test_baseline', '0'))
+   if not os.path.exists(baseline_path):
+      _save_decoded_image(baseline, baseline_path)
    for i in range(TEST_COUNT):
-      baseline_path = os.path.join(SAVE_FOLDER, IMG_FILENAME.format('test_baseline', i))
-      if not os.path.exists(baseline_path):
-         _save_decoded_image(baselines[i], baseline_path)
-      _save_decoded_image(outputs[i], os.path.join(SAVE_FOLDER, ITER_FOLDER.format(step), IMG_FILENAME.format('decoded_test', i)))
+      _save_decoded_image(outputs[i], os.path.join(SAVE_FOLDER, ITER_FOLDER.format(step), IMG_FILENAME.format('decoded_test', test_timesteps[i])))
    
    plt.clf()
-   plt.plot(np.arange(0, len(train_loss)), train_loss, label='train')
-   plt.plot(np.arange(TEST_EVERY, len(test_loss)*TEST_EVERY+1, TEST_EVERY), test_loss, label='test')
+   plt.plot(np.arange(TEST_EVERY, len(train_loss)*TEST_EVERY+1, TEST_EVERY), train_loss, label='train')
+   plt.plot(np.arange(TEST_EVERY, len(test_loss) *TEST_EVERY+1, TEST_EVERY), test_loss,  label='test')
    plt.ylim(0, None)
    plt.legend()
    plt.savefig(os.path.join(SAVE_FOLDER, LOSS_FILENAME))
    
    plt.clf()
-   plt.plot(np.arange(0, len(train_acc)), train_acc, label='train')
-   plt.plot(np.arange(TEST_EVERY, len(test_acc)*TEST_EVERY+1, TEST_EVERY), test_acc, label='test')
+   for accs, label in [(train_accs, 'train'), (test_accs, 'test')]:
+      x = np.arange(TEST_EVERY, len(accs[0])*TEST_EVERY+1, TEST_EVERY)
+      for i in range(TEST_COUNT):
+         y, l = accs[i], f"{label}_{test_timesteps[i]}"
+         plt.plot(x, y, label=l)
    plt.ylim(0.0, 1.0)
    plt.legend()
    plt.savefig(os.path.join(SAVE_FOLDER, ACCS_FILENAME))
@@ -172,7 +216,7 @@ def save_test_snapshot(step, outputs, baselines, train_loss, test_loss, train_ac
 def train():
    np.random.seed(1337)
    model = CommaVQDiffuser(*MODEL_PARAMS)
-   sd = get_state_dict(model)
+   # sd = get_state_dict(model)
    opt = Adam(get_parameters(model), LR)
    
    s_time = time.time()
@@ -192,48 +236,57 @@ def train():
    print(f"loaded dataset in {time.time() - s_time:.1f} seconds")
 
    s_time = time.time()
-   step, is_test = 0, False
+   step, test_index = 0, 0
    train_loss, test_loss = [], []
-   train_acc,  test_acc  = [], []
+   train_accs, test_accs = [[] for i in range(TEST_COUNT)], [[] for i in range(TEST_COUNT)]
    while step < ITERATIONS:
-      if is_test:
-         datas = test_datas
+      if test_index < 2:
+         data = train_datas[step % len(train_datas)]
+         index = np.random.randint(data.shape[0] - CTX_FRAMES - 1)
+      else:
+         data = test_datas[1]
          index = 0
-         size = TEST_COUNT
-      else:
-         datas = [train_datas[i % len(train_datas)] for i in range(step*BS, (step+1)*BS)]
-         index = np.random.randint(datas[0].shape[0] - CTX_FRAMES - 1)
-         size = BS
+      size = BS if test_index == 0 else TEST_COUNT
 
-      prev_frames = np.array([d[index:index+CTX_FRAMES] for d in datas]).reshape(size,-1)
-      prev_frames = Tensor(prev_frames, dtype=dtypes.float32, requires_grad=False)
-      target_frames = np.array([d[index+CTX_FRAMES] for d in datas]).reshape(size,-1)
-      target_frames = Tensor(target_frames, dtype=dtypes.float32)
-
+      prev_frames = Tensor(data[index:index+CTX_FRAMES].reshape(1,-1), dtype=dtypes.float32, requires_grad=False)
+      target_frame = Tensor(data[index+CTX_FRAMES].reshape(1,-1), dtype=dtypes.float32)
       context = model.make_context_from(prev_frames)
-      output  = model(context)
-      loss    = output.sparse_categorical_crossentropy(target_frames)
 
-      if is_test:
-         test_loss.append(loss.numpy())
-         test_acc.append((output.argmax(axis=-1) == target_frames).mean().numpy())
-      else:
+      # timesteps = np.random.randint(1, TIMESTEPS, size=(size,1)) if test_index == 0 else test_timesteps.reshape(-1,1)
+      timesteps = np.random.choice(train_timesteps, size=(BS,1), replace=False) if test_index == 0 else test_timesteps.reshape(-1,1)
+      alphas = Tensor(timesteps.astype(np.float32) / float(TIMESTEPS-1), dtype=dtypes.float32, requires_grad=False).reshape((-1,1,1))
+      x_0 = model.make_x_0_from(target_frame)
+      x_t = (1-alphas)*x_0 + alphas*Tensor.randn(*x_0.shape)
+
+      e_t = model(x_t, context, Tensor(timesteps, dtype=dtypes.float32, requires_grad=False))
+      output = model.estimate(x_t, e_t)
+      loss = output.sparse_categorical_crossentropy(target_frame)
+
+      if test_index == 0:
          loss.realize()
          opt.zero_grad()
          loss.backward()
          opt.step()
-
-         train_loss.append(loss.numpy())
-         train_acc.append((output.argmax(axis=-1) == target_frames).mean().numpy())
+      else:
+         if test_index == 1:
+            train_loss.append(loss.numpy())
+            accs = train_accs
+         else:
+            test_loss.append(loss.numpy())
+            accs = test_accs
+         for i in range(TEST_COUNT):
+            accs[i].append((output[i].argmax(axis=-1) == target_frame).mean().numpy())
       
-
       if (step+1) % TEST_EVERY == 0:
-         if is_test:
-            step += 1
-            print(f"Step {str(step): >5} | Train Loss: {sum(train_loss[-TEST_EVERY:])/TEST_EVERY:.4f} | Train Accuracy: {100.0*sum(train_acc[-TEST_EVERY:])/TEST_EVERY:.2f}% | Test Loss: {test_loss[-1]:.4f} | Test Accuracy: {100.0*test_acc[-1]:.2f}% | {(time.time() - s_time) / float(TEST_EVERY):.2f} sec/iter")
+         if test_index == 2:
+            print(f"Step {str(step+1): >5} | Train Loss: {sum(train_loss[-1:]):.4f} | Train Accuracy: {100.0*sum(train_accs[i][-1] for i in range(TEST_COUNT))/TEST_COUNT:.2f}% | Test Loss: {test_loss[-1]:.4f} | Test Accuracy: {100.0*sum(train_accs[i][-1] for i in range(TEST_COUNT))/TEST_COUNT:.2f}% | {(time.time() - s_time) / float(TEST_EVERY):.2f} sec/iter")
             s_time = time.time()
-            save_test_snapshot(step, output.argmax(axis=-1), target_frames, train_loss, test_loss, train_acc, test_acc)
-         is_test = not is_test
+            save_test_snapshot(step+1, output.argmax(axis=-1), target_frame, train_loss, test_loss, train_accs, test_accs)
+
+         test_index += 1
+         if test_index > 2:
+            test_index = 0
+            step += 1
       else:
          step += 1
 
@@ -250,7 +303,7 @@ def generate(gen_count=10):
 
    np.random.seed(1337)
    model = CommaVQDiffuser(*MODEL_PARAMS)
-   load_state_dict(model, safe_load(os.path.join("weights", "2023_11_13_20_42_41_823383", MODEL_FILENAME.format("40000"))))
+   load_state_dict(model, safe_load(os.path.join("weights", "2023_11_14_21_57_40_539773", MODEL_FILENAME.format("46000"))))
 
    data = np.load(load_dataset("commaai/commavq", split='40[:2]')[1,0]['path'][0])
    prev_frames = np.zeros((CTX_FRAMES+gen_count,FRAME_SIZE))
@@ -262,17 +315,33 @@ def generate(gen_count=10):
 
       prev_frames_t = Tensor(prev_frames[i:i+CTX_FRAMES].reshape((1,-1)), dtype=dtypes.float32)
       context = model.make_context_from(prev_frames_t.detach())
-      output = model(context).argmax(axis=-1)
+
+      # alphas = Tensor(timesteps.astype(np.float32) / float(TIMESTEPS-1), dtype=dtypes.float32, requires_grad=False).reshape((-1,1,1))
+
+      timesteps = [999, 749, 499, 249]
+      x_t = Tensor.randn(1,FRAME_SIZE,DIM)
+      for j, t in enumerate(timesteps):
+         if j > 0:
+            a = Tensor(t/float(TIMESTEPS-1), dtype=dtypes.float32)
+            x_t = model.make_x_0_from(output)*(1-a) + Tensor.randn(*x_t.shape)*a
+         timestep = Tensor([t], dtype=dtypes.float32, requires_grad=False).reshape((1,1)).expand((1,128))
+         e_t = model(x_t, context, timestep)
+         output = model.estimate(x_t, e_t).argmax(axis=-1)
+         print(j)
+         plt.clf()
+         plt.imshow(_to_image(output[0]))
+         plt.show()
+
 
       prev_frames[CTX_FRAMES+i,:] = output.numpy()[0,:]
       img = _to_image(output[0])
 
-      # plt.clf()
-      # plt.imshow(img)
-      # plt.savefig("outputs/frame.png")
+      plt.clf()
+      plt.imshow(img)
+      plt.savefig(f"outputs/frame_{i}.png")
 
-      cv2.imshow('frames', img[...,::-1])
-      cv2.waitKey()
+      # cv2.imshow('frames', img[...,::-1])
+      # cv2.waitKey()
 
       times.append(time.time() - s_time)
       while len(times) > 4:
@@ -284,5 +353,5 @@ def generate(gen_count=10):
 
 
 if __name__ == "__main__":
-   train()
+   generate()
 
