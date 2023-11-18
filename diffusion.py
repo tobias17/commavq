@@ -26,17 +26,17 @@ LOAD_COUNT     = 20
 ITERATIONS  = 100000
 SAVE_EVERY  = 4000
 TEST_EVERY  = 100
-TEST_COUNT  = 4
+TEST_COUNT  = 2
 LR = 2**-12
-BS = 5
+BS = 2
 
-DIM = 256
-N_HEADS = 4
+DIM = 384
+N_HEADS = 6
 D_HEADS = 64
-VOCAB_SIZE = 1024
-CTX_LAYERS = 2
-DEC_LAYERS = 2
+CTX_LAYERS = 3
+DEC_LAYERS = 4
 
+VOCAB_SIZE = 1024
 FRAME_SIZE = 8*16
 CTX_FRAMES = 20
 CTX_SIZE   = CTX_FRAMES * FRAME_SIZE
@@ -284,5 +284,5 @@ def generate(gen_count=10):
 
 
 if __name__ == "__main__":
-   generate()
+   train()
 
