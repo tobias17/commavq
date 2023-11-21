@@ -23,11 +23,11 @@ LOSS_FILENAME  = "graph_loss.png"
 ACCS_FILENAME  = "graph_acc.png"
 LOAD_COUNT     = 20
 
-ITERATIONS  = 100000
+ITERATIONS  = 200000
 SAVE_EVERY  = 2000
 TEST_EVERY  = 100
 TEST_COUNT  = 1
-LR = 2**-13
+LR = 2**-17
 BS = 1
 
 DIM     = 256
@@ -89,12 +89,13 @@ class CommaVQDecoder:
       return x
 
 
-def _to_image(output):
+def _to_image(output, is_numpy=False):
    if not hasattr(_to_image, 'session'):
       options  = ort.SessionOptions()
       provider = 'CPUExecutionProvider' # 'CUDAExecutionProvider'
       _to_image.session = ort.InferenceSession(f'gpt2m/decoder.onnx', options, [provider])
-   outputs = _to_image.session.run(None, {'encoding_indices': output.reshape(1,8,16).numpy().astype(np.int64)})
+   to_np = lambda x: x if is_numpy else x.numpy()
+   outputs = _to_image.session.run(None, {'encoding_indices': to_np(output.reshape(1,8,16)).astype(np.int64)})
    img = transpose_and_clip(outputs[0].reshape(outputs[0].shape[1:]))
    return img
 
@@ -154,9 +155,30 @@ def load_datasets():
 
    return train_datas, test_datas
 
-def train():
+def get_latest_weights_folder():
+   root = "weights"
+   subdirs = [os.path.join(root, d) for d in os.listdir(root)]
+   return max([d for d in subdirs if os.path.isdir(d)], key=os.path.getmtime)
+
+def inject_latest_weights_folder(restore_count=2):
+   latest = get_latest_weights_folder()
+   global SAVE_FOLDER, LOSS_FILENAME, ACCS_FILENAME
+   SAVE_FOLDER    = latest
+   LOSS_FILENAME  = f"graph_loss_restore_{restore_count}.png"
+   ACCS_FILENAME  = f"graph_acc_restore_{restore_count}.png"
+
+def train(pickup_step=None):
    np.random.seed(1337)
    model = CommaVQDecoder()
+
+   step, is_test = 0, False
+   if pickup_step is not None:
+      step = pickup_step
+      inject_latest_weights_folder()
+      model_dir = f"{SAVE_FOLDER}/{MODEL_FILENAME.format(step)}"
+      print(f"Using {model_dir}")
+      load_state_dict(model, safe_load(model_dir))
+
    params = get_parameters(model)
    print(f"{sum(prod(p.shape) for p in params)/1e6:.2f} million parameters")
    opt = Adam(params, LR)
@@ -164,7 +186,6 @@ def train():
    train_datas, test_datas = load_datasets()
 
    s_time = time.time()
-   step, is_test = 0, False
    train_loss, test_loss = [], []
    train_acc,  test_acc  = [], []
    while step < ITERATIONS:
@@ -177,7 +198,7 @@ def train():
 
       frames = np.full((BS,MAX_CTX_SIZE+FRAME_SIZE), BOS_TOKEN, dtype=np.float32)
       for i in range(CTX_FRAMES+1):
-         frames[0,1+i*FRAME_SIZE:(i+1)*FRAME_SIZE] = data[index].flatten()
+         frames[0,1+i*FRAME_SIZE:(i+1)*FRAME_SIZE] = data[index + i].flatten()
 
       inputs  = Tensor(frames[:,:-1], dtype=dtypes.float32, requires_grad=False)
       targets = Tensor(frames[:,-(FRAME_SIZE-1):], dtype=dtypes.float32)
@@ -212,30 +233,39 @@ def train():
          safe_save(get_state_dict(model), os.path.join(SAVE_FOLDER, MODEL_FILENAME.format(step)))
 
 
-def generate(gen_count=50, iter=30000):
+def generate(gen_count=50, iter=152000):
    Tensor.no_grad = True
 
    np.random.seed(1337)
    model = CommaVQDecoder()
-   load_state_dict(model, safe_load(os.path.join("weights", "2023_11_17_20_33_40_474544", MODEL_FILENAME.format(iter))))
+   latest = get_latest_weights_folder()
+   load_state_dict(model, safe_load(os.path.join(latest, MODEL_FILENAME.format(iter))))
 
    data = np.load(load_dataset("commaai/commavq", split='40[:2]')[0,0]['path'][0])
-   prev_frames = np.zeros((CTX_FRAMES+gen_count,FRAME_SIZE))
+   prev_frames = np.zeros((CTX_FRAMES+gen_count,FRAME_SIZE-1))
    prev_frames[:CTX_FRAMES] = data[:CTX_FRAMES].reshape((CTX_FRAMES,-1))
 
    times = []
    for i in range(gen_count):
       s_time = time.time()
 
-      prev_frames_t = Tensor(prev_frames[i:i+CTX_FRAMES].reshape((1,-1)), dtype=dtypes.float32)
-      context = model.make_context_from(prev_frames_t.detach())
-      output = model(context).argmax(axis=-1)
+      data = prev_frames[i:i+CTX_FRAMES]
+      frames = np.full((BS,MAX_CTX_SIZE+FRAME_SIZE), BOS_TOKEN, dtype=np.float32)
+      for i in range(CTX_FRAMES):
+         frames[0,1+i*FRAME_SIZE:(i+1)*FRAME_SIZE] = data[i].flatten()
 
-      prev_frames[CTX_FRAMES+i,:] = output.numpy()[0,:]
-      img = _to_image(output[0])
+      for j in trange(FRAME_SIZE-1, 0, -1):
+         inputs = Tensor(frames[:,:-j], dtype=dtypes.float32, requires_grad=False)
+         frames[:,-j] = model(inputs).argmax(axis=-1)[:,-1].numpy()
+         del inputs
+
+      output = frames[0,-(FRAME_SIZE-1):]
+
+      prev_frames[CTX_FRAMES+i,:] = output
+      img = _to_image(output, is_numpy=True)
 
       cv_img = img[...,::-1]
-      cv2.imshow('before', cv2.resize(_to_image(prev_frames_t[0][-FRAME_SIZE:])[...,::-1], (cv_img.shape[1]*4, cv_img.shape[0]*4)))
+      cv2.imwrite(f'outputs/frame_{i}.png', cv_img)
       cv2.imshow('frames', cv2.resize(cv_img, (cv_img.shape[1]*4, cv_img.shape[0]*4)))
       cv2.waitKey()
 
@@ -249,5 +279,5 @@ def generate(gen_count=50, iter=30000):
 
 
 if __name__ == "__main__":
-   train()
+   generate()
 
